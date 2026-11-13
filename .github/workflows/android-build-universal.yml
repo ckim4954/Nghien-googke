@@ -1,4 +1,5 @@
-name: Android Universal Builder
+
+name: Build Diem Danh Hoc Phi APK
 
 on:
   workflow_dispatch:
@@ -10,517 +11,291 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: android-universal-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Detect, Prepare and Build Android APK
+    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      # 1. Get repository files. Do not enable Gradle cache before ZIP extraction.
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-      # 2. Find an Android project in the repository, or safely extract ZIP archives
-      #    and then search the extracted directory tree. This avoids ZIP path-prefix bugs.
-      - name: Find and extract Android source
-        id: source
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          python3 <<'PY'
-          import os
-          import re
-          import shutil
-          import sys
-          import zipfile
-          from pathlib import Path
-
-          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-          temp_root = Path(os.environ["RUNNER_TEMP"]) / "android-universal-source"
-          if temp_root.exists():
-              shutil.rmtree(temp_root)
-          temp_root.mkdir(parents=True)
-
-          SKIP_DIRS = {
-              ".git", ".gradle", ".idea", "build", "node_modules",
-              ".aistudio", "_seedr_android_source", "android-universal-source"
-          }
-
-          def has_settings(folder: Path) -> bool:
-              return ((folder / "settings.gradle").is_file()
-                      or (folder / "settings.gradle.kts").is_file())
-
-          def has_android_module(folder: Path) -> bool:
-              # A valid project has at least one module build file below the root.
-              for current, dirs, files in os.walk(folder):
-                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                  p = Path(current)
-                  if p == folder:
-                      continue
-                  if "build.gradle" in files or "build.gradle.kts" in files:
-                      return True
-              return False
-
-          def is_project(folder: Path) -> bool:
-              return folder.is_dir() and has_settings(folder) and has_android_module(folder)
-
-          def find_projects(base: Path):
-              found = []
-              for current, dirs, files in os.walk(base):
-                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                  p = Path(current)
-                  if has_settings(p) and has_android_module(p):
-                      found.append(p.resolve())
-                      # Do not treat nested modules as independent projects.
-                      dirs[:] = []
-              return found
-
-          # Prefer a project already checked out as normal folders.
-          direct_projects = find_projects(workspace)
-          direct_projects = [p for p in direct_projects if temp_root not in p.parents]
-
-          selected = None
-          if len(direct_projects) == 1:
-              selected = direct_projects[0]
-          elif len(direct_projects) > 1:
-              print("ERROR: More than one Android project exists directly in the repository:")
-              for p in direct_projects:
-                  print(" -", p)
-              sys.exit(1)
-
-          # If no direct project exists, inspect ZIP archives anywhere in the repository.
-          if selected is None:
-              archives = []
-              for p in workspace.rglob("*.zip"):
-                  if any(part in SKIP_DIRS for part in p.parts):
-                      continue
-                  name = p.name.lower()
-                  if name.startswith("logs") or name.startswith("log_") or name.startswith("log-"):
-                      continue
-                  if "diagnostic" in name or "artifact" in name:
-                      continue
-                  archives.append(p.resolve())
-
-              if not archives:
-                  print("ERROR: No Android project folders or ZIP archives found.")
-                  print("Repository root contents:")
-                  for item in workspace.iterdir():
-                      print(" -", item.name)
-                  sys.exit(1)
-
-              extracted_projects = []
-              for index, archive in enumerate(archives, start=1):
-                  destination = temp_root / f"archive-{index}"
-                  destination.mkdir(parents=True, exist_ok=True)
-                  print(f"Inspecting ZIP: {archive}")
-
-                  try:
-                      with zipfile.ZipFile(archive) as zf:
-                          safe_members = []
-                          for member in zf.infolist():
-                              # Reject path traversal and do not extract symbolic links.
-                              target = (destination / member.filename).resolve()
-                              if not target.is_relative_to(destination.resolve()):
-                                  raise RuntimeError(f"Unsafe ZIP entry: {member.filename}")
-                              mode = (member.external_attr >> 16) & 0o170000
-                              if mode == 0o120000:
-                                  print(f"Skipping ZIP symlink: {member.filename}")
-                                  continue
-                              safe_members.append(member)
-                          zf.extractall(destination, members=safe_members)
-                  except Exception as exc:
-                      print(f"WARNING: Cannot extract {archive}: {exc}")
-                      continue
-
-                  for project in find_projects(destination):
-                      extracted_projects.append((archive, project))
-
-              if len(extracted_projects) == 1:
-                  selected = extracted_projects[0][1]
-              elif len(extracted_projects) > 1:
-                  print("ERROR: Multiple Android projects were found in ZIP archives:")
-                  for archive, project in extracted_projects:
-                      print(f" - ZIP: {archive} | PROJECT: {project}")
-                  print("Keep only the intended Android source ZIP in the repository.")
-                  sys.exit(1)
-              else:
-                  print("ERROR: ZIP files were found, but none contained a valid Android Gradle project.")
-                  print("A valid project needs settings.gradle(.kts) and at least one module build.gradle(.kts).")
-                  sys.exit(1)
-
-          selected = selected.resolve()
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write(f"PROJECT_DIR={selected}\n")
-
-          print("==================================================")
-          print("ANDROID PROJECT DETECTED")
-          print(selected)
-          print("==================================================")
-          for item in sorted(selected.iterdir(), key=lambda x: x.name.lower()):
-              print(("DIR  " if item.is_dir() else "FILE ") + item.name)
-          PY
-
-      # 3. Inspect Gradle, AGP, SDK and app modules after the source is available.
-      - name: Analyze project configuration
-        id: analyze
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          python3 <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          root = Path.cwd()
-
-          def read(path):
-              p = root / path
-              return p.read_text(errors="ignore") if p.is_file() else ""
-
-          wrapper = read("gradle/wrapper/gradle-wrapper.properties")
-          version_catalog = read("gradle/libs.versions.toml")
-          root_build = read("build.gradle") + read("build.gradle.kts")
-
-          gradle_version = None
-          m = re.search(r"gradle-([0-9][0-9A-Za-z.+-]*)-(?:bin|all)\.zip", wrapper)
-          if m:
-              gradle_version = m.group(1)
-
-          agp = None
-          patterns = [
-              r'(?m)^\s*agp\s*=\s*["\']([^"\']+)',
-              r'com\.android\.tools\.build:gradle:([0-9][0-9A-Za-z.+-]*)',
-              r'id\(["\']com\.android\.(?:application|library)["\']\)\s*version\s*["\']([^"\']+)',
-          ]
-          for pattern in patterns:
-              m = re.search(pattern, version_catalog + "\n" + root_build)
-              if m:
-                  agp = m.group(1)
-                  break
-
-          module_builds = []
-          for p in root.rglob("build.gradle"):
-              if any(x in p.parts for x in ("build", ".gradle", "node_modules")):
-                  continue
-              module_builds.append(p)
-          for p in root.rglob("build.gradle.kts"):
-              if any(x in p.parts for x in ("build", ".gradle", "node_modules")):
-                  continue
-              module_builds.append(p)
-
-          app_modules = []
-          for p in module_builds:
-              if p.parent == root:
-                  continue
-              text = p.read_text(errors="ignore")
-              is_app = any(token in text for token in (
-                  'com.android.application',
-                  'alias(libs.plugins.android.application)',
-                  'com.android.tools.build:gradle'
-              ))
-              if is_app:
-                  rel = p.parent.relative_to(root).as_posix()
-                  app_modules.append(rel)
-
-          # Fall back to the conventional app module when plugin aliases prevent static detection.
-          if not app_modules and ((root / "app/build.gradle").is_file()
-                                  or (root / "app/build.gradle.kts").is_file()):
-              app_modules = ["app"]
-
-          if not gradle_version:
-              if not agp:
-                  raise SystemExit("Cannot determine Gradle version: no wrapper distribution and no AGP version found.")
-              major = int(agp.split(".")[0])
-              if major >= 9:
-                  gradle_version = "9.3.1"
-              elif major >= 8:
-                  gradle_version = "8.13"
-              elif major >= 7:
-                  gradle_version = "7.6.4"
-              else:
-                  gradle_version = "6.9.4"
-
-          # Modern Android Gradle Plugin versions require JDK 17.
-          java_version = "17"
-          if agp:
-              agp_major = int(agp.split(".")[0])
-              if agp_major == 7:
-                  java_version = "11"
-              elif agp_major <= 4:
-                  java_version = "11"
-
-          # Read compileSdk from common Groovy/Kotlin DSL forms and version catalogs.
-          all_gradle = root_build + "\n" + "\n".join(
-              p.read_text(errors="ignore") for p in module_builds
-          )
-          compile_sdk = None
-          sdk_patterns = [
-              r"compileSdk\s*\{\s*version\s*=\s*release\(\s*(\d+)",
-              r"compileSdk(?:Version)?\s*[=( ]+\s*[\"']?(\d+)",
-              r"compileSdk\s+(\d+)",
-          ]
-          for pattern in sdk_patterns:
-              m = re.search(pattern, all_gradle, re.S)
-              if m:
-                  compile_sdk = m.group(1)
-                  break
-          if not compile_sdk:
-              m = re.search(r'(?m)^\s*compileSdk\s*=\s*["\']?(\d+)', version_catalog)
-              if m:
-                  compile_sdk = m.group(1)
-          compile_sdk = compile_sdk or "36"
-
-          build_tools = None
-          m = re.search(r'buildToolsVersion\s*[=( ]+\s*["\']([0-9.]+)', all_gradle)
-          if m:
-              build_tools = m.group(1)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"gradle_version={gradle_version}\n")
-              out.write(f"java_version={java_version}\n")
-              out.write(f"agp_version={agp or 'unknown'}\n")
-              out.write(f"compile_sdk={compile_sdk}\n")
-              out.write(f"build_tools={build_tools or ''}\n")
-              out.write(f"app_modules={','.join(app_modules)}\n")
-
-          print("PROJECT CONFIGURATION")
-          print("Gradle:", gradle_version)
-          print("AGP:", agp or "not statically detected")
-          print("Java:", java_version)
-          print("Compile SDK:", compile_sdk)
-          print("Build Tools:", build_tools or "AGP default")
-          print("Application modules:", app_modules or "not statically detected; will run assembleDebug")
-          PY
-
-      # 4. Install Java only after source extraction and project inspection.
-      - name: Set up Java
-        uses: actions/setup-java@v5
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.analyze.outputs.java_version }}
+          java-version: '17'
 
-      # 5. Use the SDK already provisioned on GitHub's Ubuntu runner.
-      - name: Locate Android SDK tools
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
-          if [[ -z "${ANDROID_HOME:-}" || ! -d "$ANDROID_HOME" ]]; then
-            echo "::error::Android SDK is not present on this runner."
-            exit 1
-          fi
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
-          if [[ -z "$SDKMANAGER" ]]; then
-            echo "::error::sdkmanager was not found under $ANDROID_HOME/cmdline-tools."
-            exit 1
-          fi
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "Using SDK Manager: $SDKMANAGER"
-
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          set +o pipefail
-          yes | "$SDKMANAGER" --licenses >/dev/null
-          set -o pipefail
-
-      # 6. Install only the SDK packages required by the detected project.
-      - name: Install missing Android SDK components
-        env:
-          COMPILE_SDK: ${{ steps.analyze.outputs.compile_sdk }}
-          BUILD_TOOLS: ${{ steps.analyze.outputs.build_tools }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          packages=()
-
-          if [[ ! -d "$ANDROID_HOME/platforms/android-$COMPILE_SDK" ]]; then
-            packages+=("platforms;android-$COMPILE_SDK")
-          fi
-          if [[ ! -d "$ANDROID_HOME/platform-tools" ]]; then
-            packages+=("platform-tools")
-          fi
-          if [[ -n "$BUILD_TOOLS" && ! -d "$ANDROID_HOME/build-tools/$BUILD_TOOLS" ]]; then
-            packages+=("build-tools;$BUILD_TOOLS")
-          fi
-
-          if (( ${#packages[@]} > 0 )); then
-            printf 'Installing: %s\n' "${packages[@]}"
-            "$SDKMANAGER" --install "${packages[@]}"
-          else
-            echo "Required SDK packages are already installed."
-          fi
-
-          test -d "$ANDROID_HOME/platforms/android-$COMPILE_SDK"
-          test -d "$ANDROID_HOME/platform-tools"
-
-      # 7. Set up the exact Gradle distribution from the wrapper when available.
-      - name: Set up compatible Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: ${{ steps.analyze.outputs.gradle_version }}
-          cache-read-only: false
+          gradle-version: '8.9'
 
-      - name: Prepare project Gradle launcher
-        id: gradle
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Prepare Android project
         shell: bash
         run: |
-          set -Eeuo pipefail
-          if [[ -f gradlew && -f gradle/wrapper/gradle-wrapper.jar ]]; then
-            chmod +x gradlew
-            echo "launcher=./gradlew" >> "$GITHUB_OUTPUT"
-            echo "Using the project's Gradle Wrapper."
-          else
-            echo "launcher=gradle" >> "$GITHUB_OUTPUT"
-            echo "Wrapper script or JAR is missing; using the compatible Gradle installed by setup-gradle."
-          fi
+          set -e
 
-      # 8. Some AI Studio projects explicitly reference a root debug.keystore.
-      - name: Prepare debug keystore when required
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if grep -R -n --include='*.gradle' --include='*.gradle.kts' 'debug\.keystore' . >/dev/null 2>&1; then
-            if [[ ! -f debug.keystore ]]; then
-              keytool -genkeypair -noprompt \
-                -keystore debug.keystore \
-                -storepass android \
-                -alias androiddebugkey \
-                -keypass android \
-                -keyalg RSA \
-                -keysize 2048 \
-                -validity 10000 \
-                -dname 'CN=Android Debug,O=Android,C=US'
-            fi
-            keytool -list -keystore debug.keystore -storepass android >/dev/null
-            echo "Required debug keystore is ready."
-          else
-            echo "No custom debug.keystore reference found; Android default debug signing will be used."
-          fi
+          echo "Extracting application source..."
 
-      - name: Print build environment
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          java -version
-          gradle --version
-          echo "SDK platforms:"
-          ls -1 "$ANDROID_HOME/platforms"
-          echo "Build tools:"
-          ls -1 "$ANDROID_HOME/build-tools" || true
-          echo "Project: $PROJECT_DIR"
+          mkdir -p source app/src/main/assets/www
 
-      # 9. Build all debug variants. This works for conventional app modules
-      #    and avoids hard-coding the module name to :app.
-      - name: Build Debug APKs
-        id: build
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          LAUNCHER='${{ steps.gradle.outputs.launcher }}'
-          echo "Running $LAUNCHER assembleDebug"
-          $LAUNCHER --no-daemon --stacktrace --warning-mode all --no-configuration-cache assembleDebug
+          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | head -n 1)
 
-          mkdir -p "$GITHUB_WORKSPACE/output"
-          mapfile -d '' APK_FILES < <(find . -type f -path '*/build/outputs/apk/*/*.apk' -print0)
-
-          if (( ${#APK_FILES[@]} == 0 )); then
-            echo "::error::Gradle completed but no Debug APK was found. The project may be a library-only project or use a non-standard variant."
-            find . -type f -path '*/build/outputs/*' -print || true
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Source ZIP not found!"
             exit 1
           fi
 
-          index=0
-          for apk in "${APK_FILES[@]}"; do
-            index=$((index + 1))
-            name="$(basename "$apk")"
-            if [[ -e "$GITHUB_WORKSPACE/output/$name" ]]; then
-              name="${index}-${name}"
-            fi
-            cp "$apk" "$GITHUB_WORKSPACE/output/$name"
-            echo "Copied: $apk -> output/$name"
-          done
+          unzip -q "$ZIP_FILE" -d source
 
-          ls -lh "$GITHUB_WORKSPACE/output"
+          INDEX_FILE=$(find source -type f -name "index.html" | head -n 1)
 
-      - name: Verify APK files
-        if: success()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          shopt -s nullglob
-          apks=("$GITHUB_WORKSPACE"/output/*.apk)
-          if (( ${#apks[@]} == 0 )); then
-            echo "::error::No APK artifact exists."
+          if [ -z "$INDEX_FILE" ]; then
+            echo "ERROR: index.html not found!"
             exit 1
           fi
-          for apk in "${apks[@]}"; do
-            test -s "$apk"
-            echo "APK: $apk"
-            du -h "$apk"
-            sha256sum "$apk"
-          done
 
-      - name: Upload APK artifacts
-        if: success()
+          WEB_ROOT=$(dirname "$INDEX_FILE")
+
+          cp -R "$WEB_ROOT"/. app/src/main/assets/www/
+
+          if [ ! -f app/src/main/assets/www/index.html ]; then
+            echo "ERROR: Web assets were not copied!"
+            exit 1
+          fi
+
+          echo "Web application copied successfully."
+
+          mkdir -p app/src/main/java/com/diemdanh/hocphi
+          mkdir -p app/src/main/res/values
+
+      - name: Create Gradle settings
+        shell: bash
+        run: |
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "DiemDanhHocPhi"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+      - name: Create Android app configuration
+        shell: bash
+        run: |
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.diemdanh.hocphi'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.diemdanh.hocphi'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+      - name: Create Android Manifest
+        shell: bash
+        run: |
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Điểm Danh & Học Phí"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="false"
+                  android:supportsRtl="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+      - name: Create Android theme
+        shell: bash
+        run: |
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#FFFF00</item>
+                  <item name="android:statusBarColor">#1E3C72</item>
+                  <item name="android:navigationBarColor">#000000</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:windowActionModeOverlay">true</item>
+              </style>
+          </resources>
+          EOF
+
+      - name: Create MainActivity
+        shell: bash
+        run: |
+          cat > app/src/main/java/com/diemdanh/hocphi/MainActivity.kt <<'EOF'
+          package com.diemdanh.hocphi
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.webkit.WebChromeClient
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.webkit.WebSettings
+          import android.view.View
+          import android.graphics.Color
+
+          class MainActivity : Activity() {
+
+              private lateinit var webView: WebView
+
+              @Suppress("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  window.statusBarColor = Color.rgb(30, 60, 114)
+                  window.navigationBarColor = Color.BLACK
+
+                  webView = WebView(this)
+
+                  webView.setBackgroundColor(Color.WHITE)
+
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      databaseEnabled = true
+                      cacheMode = WebSettings.LOAD_DEFAULT
+                      allowFileAccess = true
+                      allowContentAccess = false
+                      javaScriptCanOpenWindowsAutomatically = false
+                      setSupportMultipleWindows(false)
+                  }
+
+                  webView.webViewClient = WebViewClient()
+                  webView.webChromeClient = WebChromeClient()
+
+                  webView.isVerticalScrollBarEnabled = true
+                  webView.isHorizontalScrollBarEnabled = true
+
+                  setContentView(webView)
+
+                  if (savedInstanceState == null) {
+                      webView.loadUrl(
+                          "file:///android_asset/www/index.html"
+                      )
+                  } else {
+                      webView.restoreState(savedInstanceState)
+                  }
+              }
+
+              override fun onSaveInstanceState(outState: Bundle) {
+                  super.onSaveInstanceState(outState)
+                  webView.saveState(outState)
+              }
+
+              @Deprecated("Deprecated in Android")
+              override fun onBackPressed() {
+                  if (::webView.isInitialized && webView.canGoBack()) {
+                      webView.goBack()
+                  } else {
+                      super.onBackPressed()
+                  }
+              }
+
+              override fun onDestroy() {
+                  if (::webView.isInitialized) {
+                      webView.destroy()
+                  }
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK was not generated!"
+            exit 1
+          fi
+
+          echo "APK generated successfully:"
+          ls -lh "$APK"
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Android-APK-${{ github.run_number }}
-          path: output/*.apk
+          name: Diem-Danh-Hoc-Phi-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
-
-      # 10. Preserve diagnostics on any failure.
-      - name: Collect build diagnostics
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
-          {
-            echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
-            echo "JAVA VERSION"
-            java -version 2>&1
-            echo "GRADLE VERSION"
-            gradle --version 2>&1
-            echo "SDK PLATFORMS"
-            ls -la "$ANDROID_HOME/platforms" 2>&1
-            echo "SDK BUILD TOOLS"
-            ls -la "$ANDROID_HOME/build-tools" 2>&1
-            echo "PROJECT_DIR=${PROJECT_DIR:-unset}"
-          } > "$GITHUB_WORKSPACE/diagnostics/environment.txt"
-
-          if [[ -n "${PROJECT_DIR:-}" && -d "$PROJECT_DIR" ]]; then
-            find "$PROJECT_DIR" -type f \( -name 'problems-report.html' -o -name '*.log' \) \
-              -not -path '*/.gradle/*' -exec cp --parents {} "$GITHUB_WORKSPACE/diagnostics/" \; 2>/dev/null
-          fi
-
-          if [[ -d "$HOME/.gradle/daemon" ]]; then
-            find "$HOME/.gradle/daemon" -type f -name '*.out.log' \
-              -exec cp --parents {} "$GITHUB_WORKSPACE/diagnostics/" \; 2>/dev/null
-          fi
-
-      - name: Upload diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Android-Build-Diagnostics-${{ github.run_number }}
-          path: diagnostics/
-          if-no-files-found: ignore
-          retention-days: 14
